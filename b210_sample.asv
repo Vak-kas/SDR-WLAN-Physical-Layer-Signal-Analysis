@@ -10,17 +10,11 @@ radios = findsdru();
 
 
 %% 초기 변수 설정
-%=====채널=====
-frequencyBand = 5;
-channelNumber = 48;
-
-%=====실험 변수====
-threshold = 0.8;  %탐지 임계값 설정
-maxLoops = 20; %실험 반복 횟수
+frequencyBand = 2.4;
+channelNumber = 1;
 captureTime = milliseconds(100); % 1000 = 1초
 justOne = false; % 동작 모드 변경
-
-%====패킷 수신 관련====
+%captureTime = 1;
 sampleRate =  20; %샘플레이트 (채널 밴드)
 decimationFactor = 1; %다운샘플링 비율
 samplePerFrame = 200000; %한 번에 몇 개 샘플을 가져오는가(묶음 크기)
@@ -29,15 +23,11 @@ gain = 20; %RF신호를 얼마나 증폭해서 받을 것인가 (dB)
 
 
 
-
-
-
-
 %% 초기 initial
 radio = radios(1);
 fc = wlanChannelFrequency(channelNumber, frequencyBand);
 sampleRate = sampleRate * 1e6;
-cbw = sampleRateToCBW(sampleRate);
+
 
 if strcmp(radio.Status, "Success")
 
@@ -57,56 +47,25 @@ else
 end
 
 
-%% 그래프 + 실험 환경 설정
 
-%그래프+실험 세팅
+%% 신호 수신 및 실시간 감지 루프
+disp("Scanning for Wi-Fi signals...");
+
+
+%그래프 그리기 용도
 fig = figure(1);
-maxHistory = 6; % 최근 패킷 몇 개 볼지
-displayLimit = 8000; % 시각화할 신호의 최대 길이
-stackView = true; %true시 상하 , false시 좌우 배치
+displayLimit = 8000; 
 
 
-plotHandles = gobjects(maxHistory,1);
-specHandles = gobjects(maxHistory,1);
-for k = 1:maxHistory
-    if stackView
-        % --- Time domain ---
-        subplot(maxHistory*2, 1, (k-1)*2 + 1);
-        plotHandles(k) = plot(NaN, NaN);
-        grid on;
-        ylabel('Amp');
-        title(sprintf('Packet #%d - Time Domain', k));
-
-        % --- Spectrogram ---
-        subplot(maxHistory*2, 1, (k-1)*2 + 2);
-        specHandles(k) = imagesc(NaN);
-        axis xy;
-        ylabel('Freq');
-        title(sprintf('Packet #%d - Spectrogram', k));
-
-    else
-        % 기존 구조 유지 (원하면 반대로 써도 됨)
-        subplot(maxHistory,2,(k-1)*2+1);
-        plotHandles(k) = plot(NaN,NaN);
-        grid on;
-
-        subplot(maxHistory,2,(k-1)*2+2);
-        specHandles(k) = imagesc(NaN);
-        axis xy;
-    end
-end
-packetHistory = cell(maxHistory,1);
-
-
-% 데이터 수신 및 패킷 처리
+maxLoops = 10;
 packetCount = 0;
 stopAll = false;
 buffer = [];
 
 
+%탐지 임계값 설정
+threshold = 0.8;
 
-%% 신호 수신 및 실시간 감지 루프
-disp("Scanning for Wi-Fi signals...");
 for i = 1:maxLoops
     
     % 데이터 수신
@@ -120,64 +79,18 @@ for i = 1:maxLoops
 
     % 신호 수신 및 처리 루프
     disp("Receiving signals...");
-    idx = wlanPacketDetect(buffer, cbw, 0, threshold);
+    idx = wlanPacketDetect(buffer, sampleRateToCBW(sampleRate), 0, threshold);
     
     while ~isempty(idx) && all(idx > 0)
         
         %% 패킷 추출
-        extractLen = 50000; 
+        extractLen = 30000; 
         if idx(1) + extractLen > size(buffer, 1)
             break; % 데이터가 더 쌓일 때까지 대기
         end
-        
         rxPacket = buffer(idx : idx + extractLen - 1);
 
-        % 1. Timing 보정
-        fineOffset = wlanSymbolTimingEstimate(rxPacket, cbw);
-        if fineOffset > 0  % 인덱스 오류 방지 안전장치
-            rxPacket = rxPacket(fineOffset:end);
-        end
-        
-        % 2. CFO 보정
-        cfo = wlanCoarseCFOEstimate(rxPacket, cbw);
-        rxPacket = frequencyOffset(rxPacket, sampleRate, -cfo);
-
-        % % 보정된 신호에서 다시 미세 타이밍 추출
-        fineOffset2 = wlanSymbolTimingEstimate(rxPacket, cbw);
-        if fineOffset2 > 0 && fineOffset2 < length(rxPacket)
-            rxPacket = rxPacket(floor(fineOffset2):end);
-        
-        end
-        
-        % 3. fieldIndices --- 
-        cfgNonHT = wlanNonHTConfig('ChannelBandwidth', cbw); %Legacy PHY 설정 객체 생성
-        indLegacy = wlanFieldIndices(cfgNonHT); %PHY필드의 샘플 위치 인덱스 반환
-        
-        % 4. LTF 추출 ---
-        ltf = rxPacket(indLegacy.LLTF(1):indLegacy.LLTF(2)); %LTF구간 추출
-        demodLTF = wlanLLTFDemodulate(ltf, cbw); %복소수 값 추출 (FFT)
-        chanEst = wlanLLTFChannelEstimate(demodLTF, cbw); %채널 추정
-        
-        % 5. Format Detect & L-SIG 검증
-        try
-            % L-SIG 체크가 포함된 포맷 탐지
-            format = wlanFormatDetect(rxPacket(indLegacy.LSIG(2)+1:end), chanEst, 0.1, cbw);
-            
-            % L-SIG를 직접 디코딩해서 CRC 체크를 한 번 더 합니다.
-            lsig = rxPacket(indLegacy.LSIG(1):indLegacy.LSIG(2));
-            [recLSIGBits, failCheck] = wlanLSIGRecover(lsig, chanEst, 0.1, cbw);
-            
-            if failCheck
-                % fprintf('Packet #%d: L-SIG CRC Failed. Skipping...\n', packetCount);
-                continue; % 에러 메시지 대신 조용히 다음 패킷으로
-            end
-            
-            disp(['Detected Format: ', format]);
-            
-        catch
-            % 신호가 너무 깨져서 함수 자체가 에러날 경우 대비
-            continue;
-        end
+        % L-SIG 디코딩
         %TODO
         %-------------
         packetCount = packetCount + 1;
@@ -189,39 +102,57 @@ for i = 1:maxLoops
         
         % ==== 시각화 ====
         set(0,'CurrentFigure',fig);
-        
         for k = 1:maxHistory
             if isempty(packetHistory{k})
                 continue;
             end
-        
+
             pkt = packetHistory{k};
             actualLimit = min(length(pkt), displayLimit);
             t = (0:actualLimit-1) / sampleRate * 1e6;
             sig = abs(pkt(1:actualLimit));
-        
+
             % --- Time domain ---
-            subplot(maxHistory*2, 1, (k-1)*2 + 1);
+            subplot(maxHistory,2,(k-1)*2+1);
             set(plotHandles(k), 'XData', t, 'YData', sig);
+        
             title(sprintf('Packet #%d (latest-%d)', packetCount-k+1, k-1));
+        
             xlim([0 t(end)]);
+        
             ylim([0 max(sig)*1.2 + 1e-6]);
         
+            
+        
             % --- Spectrogram ---
-            subplot(maxHistory*2, 1, (k-1)*2 + 2);
+        
+            subplot(maxHistory,2,(k-1)*2+2);
+        
+            
+        
             [S,F,T] = spectrogram(pkt(1:actualLimit),256,200,256,sampleRate,'centered');
+        
+            
+        
             imagesc(T*1e6, F/1e6, 20*log10(abs(S)));
+        
             axis xy;
+        
             xlabel('Time (μs)');
+        
             ylabel('Freq (MHz)');
+        
         end
         
         drawnow limitrate;
 
-        %  ================================
-        if justOne, stopAll = true; break; end
+        % ------------------------------------------
+        %  1회용 캡처 여부
+        if justOne
+            stopAll = true;
+            break;
+        end
         
-
         skip = 2000;
         if idx + skip < size(buffer,1)
             buffer = buffer(idx + skip:end,:);
